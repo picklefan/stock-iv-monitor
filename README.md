@@ -12,6 +12,40 @@ pip install -r requirements.txt
 
 ### Collect IV data
 
+**Using a config file (recommended):**
+
+Copy the example and edit it:
+```bash
+cp config.example.json config.json
+```
+
+```json
+{
+  "symbols": [
+    {
+      "ticker": "SPY",
+      "expirations": ["2026-06-18"],
+      "strikes": [590, 595, 600]
+    },
+    {
+      "ticker": "QQQ",
+      "expirations": ["2026-06-20"]
+    }
+  ]
+}
+```
+
+Each symbol can have its own expirations and strikes. Run with:
+```bash
+# One-shot
+python collect.py --config config.json
+
+# Scheduled, with 10s delay between symbols to avoid rate limits
+python collect.py --config config.json --schedule --delay 10
+```
+
+**Using CLI flags (flat — same expirations/strikes for all symbols):**
+
 **One-shot — full chain:**
 ```bash
 python collect.py --symbols SPY
@@ -93,15 +127,34 @@ Use `--top-n` or `--strikes` to reduce chart clutter when tracking many strikes.
 ## Typical workflow
 
 ```bash
-# Start tracking specific contracts on a VPS
-python collect.py --symbols SPY --expirations 2026-06-18 --strikes 590 595 600 --schedule
+# 1. Copy and edit the config with your symbols/expirations/strikes
+cp config.example.json config.json
 
-# Check progress in another terminal
+# 2. Start tracking (leave running in a terminal or on a VPS)
+python collect.py --config config.json --schedule
+
+# 3. Check progress
 python collect.py --list
 
-# After a few days, chart the IV trend for those strikes
+# 4. After a few days, chart the IV trends
 python chart.py --symbol SPY --expiration 2026-06-18 --strikes 590 595 600 --days 30
 ```
+
+Chart output files are named with filter suffixes to avoid overwriting:
+`SPY_2026-06-18.html`, `SPY_2026-06-18_top5.html`, `SPY_2026-06-18_K590-595-600.html`
+
+## Rate limits
+
+Yahoo Finance rate-limits aggressively via IP, TLS fingerprinting, cookie tracking, and User-Agent detection — not just a simple request counter. See [yf_rate_policy.md](yf_rate_policy.md) for the full research. This tool mitigates with:
+
+- **Exponential backoff** — on 429 errors, retries at 10s → 30s → 90s → 5min
+- **Browser User-Agent** header to appear as a normal browser
+- **10s default delay** between symbols (adjust with `--delay 5` or `--delay 30`)
+- Optional: install `curl-cffi` for TLS fingerprint impersonation:
+  ```bash
+  pip install curl-cffi
+  ```
+  When installed, collect.py automatically uses it to mimic Chrome's TLS fingerprint.
 
 ## Data storage
 

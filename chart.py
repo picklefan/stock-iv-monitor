@@ -200,9 +200,15 @@ def main():
     if args.output:
         out_path = Path(args.output)
     else:
+        # Build filename with filter suffix
+        suffix = ""
+        if args.top_n:
+            suffix += f"_top{args.top_n}"
+        if args.strikes:
+            suffix += f"_K{'-'.join(str(int(s)) for s in args.strikes)}"
         charts_dir = Path(__file__).resolve().parent / "charts"
         charts_dir.mkdir(exist_ok=True)
-        out_path = charts_dir / f"{symbol}_{expiration.date()}.html"
+        out_path = charts_dir / f"{symbol}_{expiration.date()}{suffix}.html"
 
     fig.write_html(str(out_path))
     print(f"Chart saved: {out_path}")

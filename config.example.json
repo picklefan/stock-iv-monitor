@@ -1,0 +1,14 @@
+{
+  "symbols": [
+    {
+      "ticker": "SPY",
+      "expirations": ["2026-06-18"],
+      "strikes": [590, 595, 600]
+    },
+    {
+      "ticker": "QQQ",
+      "expirations": ["2026-06-20"],
+      "strikes": [520, 525]
+    }
+  ]
+}

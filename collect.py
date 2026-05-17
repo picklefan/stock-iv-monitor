@@ -1,7 +1,7 @@
 """Collect options IV surface data and store in per-symbol SQLite databases."""
 
 import argparse
-import signal
+import json
 import sqlite3
 import sys
 import time
@@ -10,12 +10,47 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 ET = ZoneInfo("America/New_York")
 
 # Trading-hours collection slots in Eastern time (10am, 12pm, 2pm)
 HOURLY_SLOTS = [10, 12, 14]
+
+# Yahoo rate limits are roughly ~360 req/hour but stricter in practice.
+# Exponential backoff retry on 429 errors with these delays:
+RETRY_DELAYS = [10, 30, 90, 300]  # seconds — Yahoo cooldown can be 5-15 min
+
+# Shared session with browser-like headers to reduce chance of being blocked
+_SHARED_SESSION: requests.Session | None = None
+
+
+def _is_rate_limit(error: Exception) -> bool:
+    """Check if an error is a Yahoo rate limit (429 or related)."""
+    msg = str(error).lower()
+    return any(kw in msg for kw in ("rate limit", "too many request", "429"))
+
+
+def get_session() -> requests.Session:
+    """Return a requests Session with browser-mimicking headers."""
+    global _SHARED_SESSION
+    if _SHARED_SESSION is None:
+        _SHARED_SESSION = requests.Session()
+        _SHARED_SESSION.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        })
+        # Optionally use curl_cffi for TLS fingerprinting if installed
+        try:
+            from curl_cffi import requests as curl_requests
+            _SHARED_SESSION = curl_requests.Session(impersonate="chrome")
+        except ImportError:
+            pass
+    return _SHARED_SESSION
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -61,9 +96,23 @@ def init_db(db_path: Path) -> None:
 
 def fetch_options(symbol: str, expiration_filters: list[str] | None = None,
                   strike_filters: list[float] | None = None) -> pd.DataFrame:
-    """Fetch options chain for a symbol. Optionally filter by expiration and/or strike."""
-    ticker = yf.Ticker(symbol)
-    expirations = ticker.options
+    """Fetch options chain for a symbol, with exponential backoff on rate limits."""
+    session = get_session()
+    ticker = yf.Ticker(symbol, session=session)
+
+    # --- Get expirations with retry ---
+    for attempt, delay in enumerate(RETRY_DELAYS + [None]):
+        try:
+            expirations = ticker.options
+            break
+        except Exception as e:
+            if _is_rate_limit(e) and delay is not None:
+                print(f"  Rate limited getting expirations, retrying in {delay}s...")
+                time.sleep(delay)
+            elif delay is None:
+                raise
+    else:
+        raise RuntimeError(f"Failed to get expirations for {symbol} after retries")
     if not expirations:
         print(f"  No options data found for {symbol}")
         return pd.DataFrame()
@@ -80,21 +129,39 @@ def fetch_options(symbol: str, expiration_filters: list[str] | None = None,
         expirations = matched
         print(f"  Matched {len(expirations)} expiration(s): {', '.join(expirations)}")
 
-    # Get underlying price once (close approximation)
-    try:
-        info = ticker.info
-        underlying = info.get("regularMarketPreviousClose") or info.get("previousClose")
-    except Exception:
-        underlying = None
+    # Get underlying price once (close approximation), with retry
+    underlying = None
+    for attempt, delay in enumerate(RETRY_DELAYS + [None]):
+        try:
+            info = ticker.info
+            underlying = info.get("regularMarketPreviousClose") or info.get("previousClose")
+            break
+        except Exception as e:
+            if _is_rate_limit(e) and delay is not None:
+                time.sleep(delay)
+            elif delay is None:
+                raise
+            # non-rate-limit error: accept None
 
     quote_time = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = []
 
     for exp in expirations:
-        try:
-            chain = ticker.option_chain(exp)
-        except Exception as e:
-            print(f"  Skipping {exp}: {e}")
+        chain = None
+        for attempt, delay in enumerate(RETRY_DELAYS + [None]):
+            try:
+                chain = ticker.option_chain(exp)
+                break
+            except Exception as e:
+                if _is_rate_limit(e) and delay is not None:
+                    print(f"  Rate limited on {exp}, retrying in {delay}s...")
+                    time.sleep(delay)
+                elif delay is None:
+                    print(f"  Skipping {exp}: {e}")
+                else:
+                    print(f"  Skipping {exp}: {e}")
+                    break
+        if chain is None:
             continue
 
         for opt_type, opt_df in [("call", chain.calls), ("put", chain.puts)]:
@@ -201,10 +268,23 @@ def save_to_db(symbol: str, df: pd.DataFrame) -> int:
     return len(df)
 
 
+def load_config(path: str) -> list[dict]:
+    """Load monitoring config from a JSON file.
+    Format: {"symbols": [{"ticker": "SPY", "expirations": ["2026-06-18"], "strikes": [590, 600]}]}
+    """
+    with open(path) as f:
+        config = json.load(f)
+    if "symbols" not in config:
+        raise ValueError("Config must contain a 'symbols' key")
+    return config["symbols"]
+
+
 def collect_all(symbols: list[str], expirations: list[str] | None = None,
-                strikes: list[float] | None = None) -> None:
+                strikes: list[float] | None = None, delay: float = 10.0) -> None:
     """Run one collection cycle for all symbols."""
-    for symbol in symbols:
+    for i, symbol in enumerate(symbols):
+        if i > 0:
+            time.sleep(delay)  # avoid Yahoo rate limiting
         sym = symbol.upper()
         parts = []
         if expirations:
@@ -254,61 +334,61 @@ def next_slot_time() -> datetime:
     return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 10, 0, 0, tzinfo=ET)
 
 
-def run_scheduled(symbols: list[str], expirations: list[str] | None = None,
-                  strikes: list[float] | None = None) -> None:
-    """Run collect_all on a schedule: trading hours, every 2 hours from 10am ET."""
-    running = True
-
-    def handle_signal(signum, frame):
-        nonlocal running
-        print("\nShutting down scheduler...")
-        running = False
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    print(f"Scheduler started. Collecting {symbols} every 2 hours from 10am ET (10, 12, 2).")
+def run_scheduled(entries: list[dict], delay: float = 10.0) -> None:
+    """Run collect_from_config on a schedule: trading hours, every 2 hours from 10am ET."""
+    tickers = [e["ticker"] for e in entries]
+    print(f"Scheduler started. Collecting {tickers} every 2 hours from 10am ET (10, 12, 2).")
     print("Press Ctrl+C to stop.\n")
 
-    while running:
-        now_et = datetime.now(ET)
-        next_slot = next_slot_time()
-        wait = (next_slot - now_et).total_seconds()
+    try:
+        while True:
+            now_et = datetime.now(ET)
+            next_slot = next_slot_time()
+            wait = (next_slot - now_et).total_seconds()
 
-        # If already within a slot window (e.g. started at 10:05), run immediately
-        is_weekday = now_et.weekday() < 5
-        in_trading_window = any(
-            abs(now_et.hour - h) < 2 for h in HOURLY_SLOTS
-        )
+            is_weekday = now_et.weekday() < 5
+            in_trading_window = any(
+                abs(now_et.hour - h) < 2 for h in HOURLY_SLOTS
+            )
 
-        if is_weekday and in_trading_window and wait > 3600:
-            # We're near a slot — run now instead of waiting for the next one
-            pass
-        elif wait > 60:
-            until = next_slot.strftime("%Y-%m-%d %H:%M %Z")
-            print(f"Next collection at {until} (sleeping {wait/3600:.1f}h)...")
-            while running and wait > 0:
-                chunk = min(wait, 300)  # sleep in 5-min chunks, check signal
-                time.sleep(chunk)
-                wait -= chunk
-            continue
+            if is_weekday and in_trading_window and wait > 3600:
+                pass  # run now
+            elif wait > 60:
+                until = next_slot.strftime("%Y-%m-%d %H:%M %Z")
+                print(f"Next collection at {until} (sleeping {wait/3600:.1f}h)...")
+                while wait > 0:
+                    time.sleep(min(wait, 2))
+                    wait -= 2
+                continue
 
-        if not running:
-            break
+            ts = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"\n=== Collection at {ts} ET ===")
+            collect_from_config(entries, delay=delay)
+            print()
 
-        ts = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n=== Collection at {ts} ET ===")
-        collect_all(symbols, expirations, strikes)
-        print()
+            time.sleep(2)
 
-        # Small sleep to avoid double-fire
-        time.sleep(60)
+    except KeyboardInterrupt:
+        print("\nShutting down scheduler...")
+
+
+def collect_from_config(entries: list[dict], delay: float = 10.0) -> None:
+    """Collect all symbols defined in config entries."""
+    for i, entry in enumerate(entries):
+        if i > 0:
+            time.sleep(delay)
+        ticker = entry["ticker"]
+        exps = entry.get("expirations")
+        strikes = entry.get("strikes")
+        collect_all([ticker], exps, strikes, delay=0)  # delay handled here
 
 
 def main():
     parser = argparse.ArgumentParser(description="Collect options IV data")
     parser.add_argument("--list", action="store_true",
                         help="List all tracked symbols and their expiration statuses")
+    parser.add_argument("--config", default=None,
+                        help="JSON config file with symbols, expirations, and strikes")
     parser.add_argument("--symbols", nargs="+", help="Stock symbols (e.g. SPY QQQ)")
     parser.add_argument("--expirations", nargs="+", default=None,
                         help="Expiration dates YYYY-MM-DD, partial match ok (default: all expirations)")
@@ -316,16 +396,26 @@ def main():
                         help="Only collect specific strikes (e.g. 590 595 600)")
     parser.add_argument("--schedule", action="store_true",
                         help="Run continuously, collecting every 2 hours from 10am ET on trading days")
+    parser.add_argument("--delay", type=float, default=10.0, metavar="SECS",
+                        help="Delay between symbols to avoid rate limits (default: 10s)")
     args = parser.parse_args()
 
     if args.list:
         list_tracked()
-    elif not args.symbols:
-        parser.error("--symbols is required (or use --list)")
-    elif args.schedule:
-        run_scheduled(args.symbols, args.expirations, args.strikes)
+        return
+
+    if args.config:
+        entries = load_config(args.config)
+    elif args.symbols:
+        entries = [{"ticker": s, "expirations": args.expirations, "strikes": args.strikes}
+                   for s in args.symbols]
     else:
-        collect_all(args.symbols, args.expirations, args.strikes)
+        parser.error("--symbols or --config is required (or use --list)")
+
+    if args.schedule:
+        run_scheduled(entries, delay=args.delay)
+    else:
+        collect_from_config(entries, delay=args.delay)
 
 
 if __name__ == "__main__":

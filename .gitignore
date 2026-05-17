@@ -3,3 +3,4 @@ data/
 charts/
 *.db
 *.html
+config.json
