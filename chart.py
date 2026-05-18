@@ -70,13 +70,28 @@ def resolve_strikes(exp_df: pd.DataFrame, top_n: int | None, strikes_arg: list[f
     return all_strikes
 
 
+def resolve_skew_time(exp_df: pd.DataFrame, skew_arg: str | None) -> pd.Timestamp:
+    """Return the quote_time to use for the skew chart."""
+    times = sorted(exp_df["quote_time"].unique())
+    if not skew_arg or skew_arg == "latest":
+        return times[-1]
+    if skew_arg == "first":
+        return times[0]
+    # Try to match a specific timestamp
+    target = pd.Timestamp(skew_arg, tz="utc")
+    return min(times, key=lambda t: abs((t - target).total_seconds()))
+
+
 def build_chart(df: pd.DataFrame, symbol: str, expiration: pd.Timestamp,
-                top_n: int | None = None, strikes_arg: list[float] | None = None) -> go.Figure:
+                top_n: int | None = None, strikes_arg: list[float] | None = None,
+                skew_time: str | None = None) -> go.Figure:
     exp_df = df[df["expiration"] == expiration].copy()
     if exp_df.empty:
         raise ValueError(f"No data for expiration {expiration.date()}")
 
     strikes = resolve_strikes(exp_df, top_n, strikes_arg)
+    skew_ts = resolve_skew_time(exp_df, skew_time)
+    skew_label = skew_ts.strftime("%Y-%m-%d %H:%M")
 
     underlying = exp_df["underlying_price"].dropna()
     spot = float(underlying.iloc[-1]) if len(underlying) else float(strikes[len(strikes) // 2])
@@ -89,7 +104,7 @@ def build_chart(df: pd.DataFrame, symbol: str, expiration: pd.Timestamp,
         subplot_titles=(
             f"{symbol} — Call IV Trend (exp {expiration.date()})",
             f"{symbol} — Put IV Trend (exp {expiration.date()})",
-            f"{symbol} — IV Skew (latest snapshot)",
+            f"{symbol} — IV Skew ({skew_label})",
         ),
         vertical_spacing=0.10,
     )
@@ -126,9 +141,8 @@ def build_chart(df: pd.DataFrame, symbol: str, expiration: pd.Timestamp,
             row=2, col=1,
         )
 
-    # --- IV Skew (latest snapshot) ---
-    latest_time = exp_df["quote_time"].max()
-    latest = exp_df[exp_df["quote_time"] == latest_time]
+    # --- IV Skew ---
+    latest = exp_df[exp_df["quote_time"] == skew_ts]
     latest_calls = latest[latest["option_type"] == "call"].sort_values("strike")
     latest_puts = latest[latest["option_type"] == "put"].sort_values("strike")
 
@@ -181,6 +195,8 @@ def main():
                         help="Only show top N strikes by open interest")
     parser.add_argument("--strikes", type=float, nargs="+", default=None, metavar="STRIKE",
                         help="Only show specific strikes (e.g. 590 595 600)")
+    parser.add_argument("--skew-time", default=None, metavar="TIME",
+                        help="Snapshot for skew chart: 'latest', 'first', or 'YYYY-MM-DD HH:MM' (default: latest)")
     parser.add_argument("--output", default=None, help="Output HTML file path (default: charts/<SYMBOL>_<EXP>.html)")
     args = parser.parse_args()
 
@@ -195,7 +211,8 @@ def main():
     expiration = pick_expiration(df, args.expiration)
     print(f"Using expiration: {expiration.date()}")
 
-    fig = build_chart(df, symbol, expiration, top_n=args.top_n, strikes_arg=args.strikes)
+    fig = build_chart(df, symbol, expiration, top_n=args.top_n, strikes_arg=args.strikes,
+                      skew_time=args.skew_time)
 
     if args.output:
         out_path = Path(args.output)

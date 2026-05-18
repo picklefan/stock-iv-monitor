@@ -16,7 +16,7 @@ import yfinance as yf
 ET = ZoneInfo("America/New_York")
 
 # Trading-hours collection slots in Eastern time (10am, 12pm, 2pm)
-HOURLY_SLOTS = [10, 12, 14]
+HOURLY_SLOTS = [10, 12, 14, 16]
 
 # Yahoo rate limits are roughly ~360 req/hour but stricter in practice.
 # Exponential backoff retry on 429 errors with these delays:
@@ -257,6 +257,55 @@ def list_tracked() -> None:
             print(f"  {exp:<12} {mark}{status:<8} {snaps:<10} {contracts:<10} {first[:19]:<20} {last[:19]:<20}")
 
 
+def show_history() -> None:
+    """Show collection timestamps for each tracked ticker."""
+    if not DATA_DIR.exists():
+        print("No data directory found. Run a collection first.")
+        return
+
+    dbs = sorted(DATA_DIR.glob("*.db"))
+    if not dbs:
+        print("No tracked symbols.")
+        return
+
+    for db_path in dbs:
+        symbol = db_path.stem
+        with sqlite3.connect(str(db_path)) as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT quote_time
+                FROM iv_snapshots
+                ORDER BY quote_time
+            """).fetchall()
+
+        if not rows:
+            print(f"\n{symbol}: no data")
+            continue
+
+        times = [datetime.fromisoformat(r[0]) for r in rows]
+        print(f"\n{symbol} — {len(times)} collection(s):")
+        for t in times:
+            et = t.astimezone(ET)
+            delta = datetime.now(ET) - et
+            ago = _format_ago(delta)
+            print(f"  {et.strftime('%Y-%m-%d %H:%M %Z')} ({ago})")
+
+
+def _format_ago(delta: timedelta) -> str:
+    if delta.days > 1:
+        return f"{delta.days}d ago"
+    elif delta.days == 1:
+        return "1d ago"
+    hours = delta.seconds // 3600
+    if hours > 1:
+        return f"{hours}h ago"
+    elif hours == 1:
+        return "1h ago"
+    mins = delta.seconds // 60
+    if mins > 1:
+        return f"{mins}m ago"
+    return "just now"
+
+
 def save_to_db(symbol: str, df: pd.DataFrame) -> int:
     """Save snapshot rows to the symbol's database. Returns row count."""
     if df.empty:
@@ -277,6 +326,32 @@ def load_config(path: str) -> list[dict]:
     if "symbols" not in config:
         raise ValueError("Config must contain a 'symbols' key")
     return config["symbols"]
+
+
+def show_config(path: str) -> None:
+    """Print a summary of what's defined in a config file."""
+    entries = load_config(path)
+    est_per_run = 0
+    print(f"Config: {path}")
+    print(f"  {len(entries)} symbol(s) defined:\n")
+    for entry in entries:
+        ticker = entry["ticker"]
+        exps = entry.get("expirations") or ["ALL"]
+        strikes = entry.get("strikes") or ["ALL"]
+        n_strikes = len(strikes) if strikes != ["ALL"] else "?"
+        contracts_per_run = 0 if strikes == ["ALL"] or n_strikes == "?" else int(n_strikes) * len(exps) * 2
+        est_per_run += contracts_per_run
+        print(f"  {ticker}")
+        print(f"    Expirations: {', '.join(exps)}")
+        print(f"    Strikes:     {', '.join(str(s) for s in strikes)}")
+        if contracts_per_run:
+            print(f"    Est/run:     ~{contracts_per_run} contracts ({int(n_strikes)} strikes × {len(exps)} exp(s) × 2 types)")
+        else:
+            print(f"    Est/run:     unknown (all strikes)")
+        print()
+    if est_per_run:
+        print(f"  Total estimated: ~{est_per_run} contracts/run")
+    print(f"\n  Run with: python collect.py --config {path}")
 
 
 def collect_all(symbols: list[str], expirations: list[str] | None = None,
@@ -335,9 +410,10 @@ def next_slot_time() -> datetime:
 
 
 def run_scheduled(entries: list[dict], delay: float = 10.0) -> None:
-    """Run collect_from_config on a schedule: trading hours, every 2 hours from 10am ET."""
+    """Run collect_from_config at fixed times: 10am, 12pm, 2pm, 4pm ET on trading days."""
     tickers = [e["ticker"] for e in entries]
-    print(f"Scheduler started. Collecting {tickers} every 2 hours from 10am ET (10, 12, 2).")
+    slots_str = ", ".join(f"{h}:00" for h in HOURLY_SLOTS)
+    print(f"Scheduler started. Collecting {tickers} at {slots_str} ET on trading days.")
     print("Press Ctrl+C to stop.\n")
 
     try:
@@ -346,20 +422,12 @@ def run_scheduled(entries: list[dict], delay: float = 10.0) -> None:
             next_slot = next_slot_time()
             wait = (next_slot - now_et).total_seconds()
 
-            is_weekday = now_et.weekday() < 5
-            in_trading_window = any(
-                abs(now_et.hour - h) < 2 for h in HOURLY_SLOTS
-            )
-
-            if is_weekday and in_trading_window and wait > 3600:
-                pass  # run now
-            elif wait > 60:
+            if wait > 60:
                 until = next_slot.strftime("%Y-%m-%d %H:%M %Z")
                 print(f"Next collection at {until} (sleeping {wait/3600:.1f}h)...")
                 while wait > 0:
                     time.sleep(min(wait, 2))
                     wait -= 2
-                continue
 
             ts = datetime.now(ET).strftime("%H:%M:%S")
             print(f"\n=== Collection at {ts} ET ===")
@@ -386,7 +454,11 @@ def collect_from_config(entries: list[dict], delay: float = 10.0) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Collect options IV data")
     parser.add_argument("--list", action="store_true",
-                        help="List all tracked symbols and their expiration statuses")
+                        help="List tracked symbols from the database with active/expired status")
+    parser.add_argument("--history", action="store_true",
+                        help="Show collection timestamps for each tracked ticker")
+    parser.add_argument("--show-config", default=None, metavar="CONFIG",
+                        help="Show what a config file will track (no fetching)")
     parser.add_argument("--config", default=None,
                         help="JSON config file with symbols, expirations, and strikes")
     parser.add_argument("--symbols", nargs="+", help="Stock symbols (e.g. SPY QQQ)")
@@ -402,6 +474,14 @@ def main():
 
     if args.list:
         list_tracked()
+        return
+
+    if args.history:
+        show_history()
+        return
+
+    if args.show_config:
+        show_config(args.show_config)
         return
 
     if args.config:

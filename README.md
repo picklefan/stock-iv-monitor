@@ -35,7 +35,12 @@ cp config.example.json config.json
 }
 ```
 
-Each symbol can have its own expirations and strikes. Run with:
+Each symbol can have its own expirations and strikes. Preview without fetching:
+```bash
+python collect.py --show-config config.json
+```
+
+Run with:
 ```bash
 # One-shot
 python collect.py --config config.json
@@ -80,12 +85,16 @@ python collect.py --symbols SPY --expirations 2026-06-18 --schedule
 # VPS-friendly: specific strikes only (~1 KB/run)
 python collect.py --symbols SPY --expirations 2026-06-18 --strikes 590 595 600 --schedule
 ```
-Runs continuously. Skips weekends. Press Ctrl+C to stop.
+Runs at fixed times: 10:00, 12:00, 14:00, 16:00 ET on trading days. Skips weekends. Press Ctrl+C to stop.
 
-### List tracked expirations
+### List tracked expirations & collection history
 
 ```bash
+# Per-expiration summary with active/expired status
 python collect.py --list
+
+# Collection timestamps for each ticker
+python collect.py --history
 ```
 
 Output:
@@ -112,6 +121,12 @@ python chart.py --symbol SPY --expiration 2026-06-18 --top-n 5
 
 # Only specific strikes
 python chart.py --symbol SPY --expiration 2026-06-18 --strikes 590 595 600
+
+# Skew chart from earliest snapshot (not latest)
+python chart.py --symbol SPY --skew-time first
+
+# Skew chart from a specific collection time
+python chart.py --symbol SPY --skew-time "2026-05-18 12:00"
 
 # Custom output path
 python chart.py --symbol SPY --expiration 2026-06-18 --top-n 5 --output my_chart.html
