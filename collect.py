@@ -287,7 +287,8 @@ def show_history() -> None:
             et = t.astimezone(ET)
             delta = datetime.now(ET) - et
             ago = _format_ago(delta)
-            print(f"  {et.strftime('%Y-%m-%d %H:%M %Z')} ({ago})")
+            utc_str = t.strftime("%Y-%m-%dT%H:%M")
+            print(f"  {et.strftime('%Y-%m-%d %H:%M %Z')} ({ago})  ← copy: --delete {utc_str}")
 
 
 def _format_ago(delta: timedelta) -> str:
@@ -304,6 +305,58 @@ def _format_ago(delta: timedelta) -> str:
     if mins > 1:
         return f"{mins}m ago"
     return "just now"
+
+
+def delete_snapshots(time_filter: str, ticker: str | None = None) -> None:
+    """Delete snapshots matching a given quote_time substring."""
+    if not DATA_DIR.exists():
+        print("No data directory found.")
+        return
+
+    if ticker:
+        dbs = [DATA_DIR / f"{ticker.upper()}.db"]
+        if not dbs[0].exists():
+            print(f"No data file for {ticker.upper()}")
+            return
+    else:
+        dbs = sorted(DATA_DIR.glob("*.db"))
+
+    if not dbs:
+        print("No tracked symbols.")
+        return
+
+    for db_path in dbs:
+        symbol = db_path.stem
+        with sqlite3.connect(str(db_path)) as conn:
+            # Find matching quote_times
+            matches = conn.execute(
+                "SELECT DISTINCT quote_time FROM iv_snapshots WHERE quote_time LIKE ? ORDER BY quote_time",
+                (f"%{time_filter}%",)
+            ).fetchall()
+
+            if not matches:
+                print(f"{symbol}: no snapshots matching '{time_filter}'")
+                continue
+
+            print(f"\n{symbol} — {len(matches)} matching snapshot(s):")
+            for (qt,) in matches:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM iv_snapshots WHERE quote_time = ?", (qt,)
+                ).fetchone()[0]
+                print(f"  {qt}  ({count} contracts)")
+
+            # Confirm
+            answer = input("\nDelete these snapshots? [y/N] ")
+            if answer.lower() != "y":
+                print("  Skipped.")
+                continue
+
+            for (qt,) in matches:
+                deleted = conn.execute(
+                    "DELETE FROM iv_snapshots WHERE quote_time = ?", (qt,)
+                ).rowcount
+                print(f"  Deleted {deleted} rows from {symbol} ({qt})")
+        print()
 
 
 def save_to_db(symbol: str, df: pd.DataFrame) -> int:
@@ -457,6 +510,10 @@ def main():
                         help="List tracked symbols from the database with active/expired status")
     parser.add_argument("--history", action="store_true",
                         help="Show collection timestamps for each tracked ticker")
+    parser.add_argument("--delete", default=None, metavar="TIME",
+                        help="Delete snapshots matching a timestamp (use with --ticker to scope)")
+    parser.add_argument("--ticker", default=None,
+                        help="Limit --delete or --history to a specific ticker")
     parser.add_argument("--show-config", default=None, metavar="CONFIG",
                         help="Show what a config file will track (no fetching)")
     parser.add_argument("--config", default=None,
@@ -478,6 +535,10 @@ def main():
 
     if args.history:
         show_history()
+        return
+
+    if args.delete:
+        delete_snapshots(args.delete, ticker=args.ticker)
         return
 
     if args.show_config:
